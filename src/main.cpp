@@ -65,18 +65,36 @@ void loop() {
   else if (co2ppm > 800) currentState = 1;
   else currentState = 0;
 
-  if (currentState == 0) {
+if (currentState == 0) {
     if (millis() - normalTimer > 2000) {
-      lcd.clear(); lcd.setCursor(0, 0);
-      if (displayIndex == 0) lcd.print("Greenhouse OK");
-      else if (displayIndex == 1) lcd.print(WiFi.status() == WL_CONNECTED ? "WiFi Connected" : "WiFi Failed");
-      else if (displayIndex == 2) { lcd.print("Vent: CLOSED"); ventServo.write(0); }
-      else { lcd.print("Air OK "); lcd.print(co2ppm, 0); lcd.print("ppm"); lcd.setCursor(0, 1); lcd.print("System OK"); }
+      lcd.clear();
+      if (displayIndex == 0) {
+        lcd.setCursor(0, 0); lcd.print("System Within");
+        lcd.setCursor(0, 1); lcd.print("Optimal Params");
+      }
+      else if (displayIndex == 1) {
+        if (WiFi.status() == WL_CONNECTED) {
+          lcd.setCursor(0, 0); lcd.print("WiFi Connected");
+          lcd.setCursor(0, 1); lcd.print(ssid);
+        } else {
+          lcd.setCursor(0, 0); lcd.print("WiFi Failed");
+        }
+      }
+      else if (displayIndex == 2) {
+        lcd.setCursor(0, 0); lcd.print("Vent: CLOSED");
+        ventServo.write(0);
+      }
+      else {
+        lcd.setCursor(0, 0); lcd.print("Air OK ");
+        lcd.print(co2ppm, 0); lcd.print("ppm");
+        lcd.setCursor(0, 1); lcd.print("System OK");
+      }
       displayIndex = (displayIndex + 1) % numStatuses;
       normalTimer = millis();
     }
     digitalWrite(ledG, HIGH); digitalWrite(ledO, LOW); digitalWrite(ledR, LOW); digitalWrite(buzzer, LOW);
   }
+
 
   else if (currentState == 1) {
     lcd.clear(); lcd.setCursor(0, 0); lcd.print("WARNING CO2 High");
