@@ -4,6 +4,13 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ESP32Servo.h>
+#define GSM_RX 16
+#define GSM_TX 17
+#define GSM_RST 5
+#define PHONE "+353830423660"  // my number
+
+bool smsSent = false;  // Stops repeat SMS spam
+
 
 rgb_lcd lcd;
 AsyncWebServer server(80);
@@ -19,13 +26,24 @@ bool testFire = false;
 Servo ventServo;
 
 int displayIndex = 0;
-const int numStatuses = 4;
+const int numStatuses = 5;
 
 // State 0 = NORMAL, 1 = WARNING, 2 = DANGER
 int currentState = 0;
 
 void setup() {
   Serial.begin(115200);
+
+  Serial2.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+pinMode(GSM_RST, OUTPUT);
+digitalWrite(GSM_RST, HIGH);
+delay(3000);  // Wait for module to register on network
+Serial2.println("AT");        // Handshake
+delay(1000);
+Serial2.println("AT+CMGF=1"); // Set SMS text mode
+delay(1000);
+Serial.println("GSM Ready");
+
 
   lcd.begin(16, 2);
   lcd.setRGB(0, 0, 255);
@@ -54,6 +72,31 @@ server.begin();
   digitalWrite(ledG, HIGH); digitalWrite(ledO, LOW); digitalWrite(ledR, LOW); digitalWrite(buzzer, LOW);
 }
 
+  void sendSMS(String message) {
+  Serial2.println("AT+CMGF=1");
+  delay(500);
+  Serial2.println("AT+CMGS=\"" + String(PHONE) + "\"");
+  delay(500);
+  Serial2.print(message);
+  Serial2.write(26);  // Ctrl+Z sends the SMS
+  delay(3000);
+  Serial.println("SMS Sent: " + message);
+}
+
+  String getSimStatus() {
+  Serial2.println("AT+CREG?");
+  delay(500);
+  String response = "";
+  while (Serial2.available()) {
+    response += (char)Serial2.read();
+  }
+  if (response.indexOf("+CREG: 0,1") >= 0 || response.indexOf("+CREG: 0,5") >= 0)
+    return "SIM: Registered";
+  else
+    return "SIM: No Network";
+}
+
+
 void loop() {
   static unsigned long normalTimer = 0;
 
@@ -65,7 +108,9 @@ void loop() {
   else if (co2ppm > 800) currentState = 1;
   else currentState = 0;
 
-if (currentState == 0) {
+  if (currentState == 0) {
+    smsSent = false;
+
     if (millis() - normalTimer > 2000) {
       lcd.clear();
       if (displayIndex == 0) {
@@ -81,6 +126,11 @@ if (currentState == 0) {
         }
       }
       else if (displayIndex == 2) {
+        String simStatus = getSimStatus();
+        lcd.setCursor(0, 0); lcd.print(simStatus);
+        lcd.setCursor(0, 1); lcd.print("GSM Module OK");
+      }
+      else if (displayIndex == 3) {
         lcd.setCursor(0, 0); lcd.print("Vent: CLOSED");
         ventServo.write(0);
       }
@@ -95,8 +145,11 @@ if (currentState == 0) {
     digitalWrite(ledG, HIGH); digitalWrite(ledO, LOW); digitalWrite(ledR, LOW); digitalWrite(buzzer, LOW);
   }
 
-
   else if (currentState == 1) {
+    if (!smsSent) {
+      sendSMS("WARNING: CO2 " + String(co2ppm) + "ppm - Vent partially opened!");
+      smsSent = true;
+    }
     lcd.clear(); lcd.setCursor(0, 0); lcd.print("WARNING CO2 High");
     lcd.setCursor(0, 1); lcd.print(co2ppm, 0); lcd.print("ppm");
     digitalWrite(ledO, HIGH); digitalWrite(ledG, LOW); digitalWrite(ledR, LOW); digitalWrite(buzzer, LOW);
@@ -104,9 +157,15 @@ if (currentState == 0) {
   }
 
   else if (currentState == 2) {
+    if (!smsSent) {
+      sendSMS("DANGER: CO2 " + String(co2ppm) + "ppm - Vent fully opened!");
+      smsSent = true;
+    }
     lcd.clear(); lcd.setCursor(0, 0); lcd.print("DANGER Vent Open");
     lcd.setCursor(0, 1); lcd.print(co2ppm, 0); lcd.print("ppm");
     digitalWrite(ledR, HIGH); digitalWrite(ledG, LOW); digitalWrite(ledO, LOW); digitalWrite(buzzer, HIGH);
     ventServo.write(180);
   }
 }
+
+
