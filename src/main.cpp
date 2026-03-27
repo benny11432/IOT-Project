@@ -342,7 +342,7 @@ void loop() {
       } else if (displayIndex == 1) {
         if (WiFi.status() == WL_CONNECTED) {
           lcd.setCursor(0, 0); lcd.print("WiFi Connected");
-          lcd.setCursor(0, 1); lcd.print(ssid);
+          lcd.setCursor(0, 1); lcd.print(WiFi.localIP());
         } else {
           lcd.setCursor(0, 0); lcd.print("WiFi Failed");
         }
