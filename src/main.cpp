@@ -4,12 +4,16 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ESP32Servo.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #define GSM_RX 16
 #define GSM_TX 17
 #define PHONE "+353830423660"
 
-bool smsSent = false;
+bool smsSent          = false;
+unsigned long dangerStart = 0;
+bool ventFailed       = false;
 
 rgb_lcd lcd;
 AsyncWebServer server(80);
@@ -52,7 +56,7 @@ void initGSM() {
   while (Serial2.available()) Serial.write(Serial2.read());
 
   Serial.println("Waiting for network...");
-  for (int i = 0; i < 15; i++) {
+  for (int i = 0; i < 30; i++) {
     Serial2.print("AT+CREG?\r");
     delay(1000);
     String resp = "";
@@ -91,8 +95,7 @@ void tickSMS() {
           Serial2.print("AT+CMGS=\"" + String(PHONE) + "\"\r");
           smsState = SMS_WAIT_CMGS;
         } else {
-          // retry
-          Serial2.print("AT+CMGF=1\r");
+          Serial2.print("AT+CMGF=1\r"); // retry
         }
         smsTimer = millis();
       }
@@ -102,8 +105,8 @@ void tickSMS() {
       if (millis() - smsTimer > 1000) {
         Serial2.print(pendingSmsMsg);
         Serial2.print("\r");
-        Serial2.write(26);    // Ctrl+Z
-        Serial2.println();    // flush
+        Serial2.write(26);
+        Serial2.println();
         smsState = SMS_WAIT_DONE;
         smsTimer = millis();
       }
@@ -158,9 +161,10 @@ String buildDashboard() {
   String wifiStatus = (WiFi.status() == WL_CONNECTED) ? "Connected" : "Disconnected";
   String stateLabel, stateColor;
 
-  if (currentState == 2)      { stateLabel = "DANGER";  stateColor = "#e74c3c"; }
-  else if (currentState == 1) { stateLabel = "WARNING"; stateColor = "#f39c12"; }
-  else                        { stateLabel = "NORMAL";  stateColor = "#2ecc71"; }
+  if (ventFailed)                 { stateLabel = "VENT FAILED"; stateColor = "#c0392b"; }
+  else if (currentState == 2)     { stateLabel = "DANGER";      stateColor = "#e74c3c"; }
+  else if (currentState == 1)     { stateLabel = "WARNING";     stateColor = "#f39c12"; }
+  else                            { stateLabel = "NORMAL";      stateColor = "#2ecc71"; }
 
   String ventPos = (currentState == 2) ? "Fully Open (180&deg;)" :
                    (currentState == 1) ? "Partially Open (90&deg;)" : "Closed (0&deg;)";
@@ -196,8 +200,8 @@ String buildDashboard() {
   </style>
 </head>
 <body>
-  <h1>&#127807; Greenhouse Monitor</h1>
-  <p class="subtitle">Auto-refreshes every 5 seconds</p>
+  <h1>Greenhouse Monitor</h1>
+  <p class="subtitle">Updates every 5 seconds</p>
   <div class="grid">
 
     <div class="card">
@@ -258,11 +262,11 @@ String buildDashboard() {
   html += R"rawhtml("></span>)rawhtml";
   html += testFire ? "ACTIVE" : "Inactive";
   html += R"rawhtml(</div>
-      <div class="unit">Manual fire trigger button</div>
+      <div class="unit">Manual Danger trigger button</div>
     </div>
 
   </div>
-  <p class="footer">Greenhouse IoT System &mdash; ESP32 &mdash; ATU Galway</p>
+  <p class="footer">Greenhouse IoT System &mdash; ESP32 &mdash; Ben Ryan - G00462517</p>
 </body>
 </html>
 )rawhtml";
@@ -272,6 +276,8 @@ String buildDashboard() {
 
 // ─── SETUP ───────────────────────────────────────────────────────────────────
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
   initGSM();
@@ -311,7 +317,7 @@ void setup() {
 void loop() {
   static unsigned long normalTimer = 0;
 
-  tickSMS(); // non-blocking, runs every iteration
+  tickSMS();
 
   int sensorValue = analogRead(smokePin);
   co2ppm   = map(sensorValue, 100, 3000, 400, 2000);
@@ -323,18 +329,21 @@ void loop() {
 
   // ── NORMAL ──
   if (currentState == 0) {
-    smsSent = false;
+    smsSent     = false;
+    ventFailed  = false;
+    dangerStart = 0;
     if (millis() - normalTimer > 2000) {
       lcd.clear();
       if (displayIndex == 0) {
-        lcd.setCursor(0, 0); lcd.print("System Within");
-        lcd.setCursor(0, 1); lcd.print("Optimal Params");
+        lcd.setCursor(0, 0); lcd.print("System Normal");
+        lcd.setCursor(0, 1); lcd.print("Standby");
       } else if (displayIndex == 1) {
         if (WiFi.status() == WL_CONNECTED) {
           lcd.setCursor(0, 0); lcd.print("WiFi Connected");
           lcd.setCursor(0, 1); lcd.print(WiFi.localIP());
         } else {
           lcd.setCursor(0, 0); lcd.print("WiFi Failed");
+          lcd.setCursor(0, 1); lcd.print("Check Connection");
         }
       } else if (displayIndex == 2) {
         lcd.setCursor(0, 0); lcd.print(cachedSimStatus);
@@ -370,15 +379,34 @@ void loop() {
 
   // ── DANGER ──
   else if (currentState == 2) {
+    if (dangerStart == 0) dangerStart = millis();
+
     if (!smsSent && smsState == SMS_IDLE) {
       queueSMS("DANGER: CO2 " + String(co2ppm) + "ppm - Vent fully opened!");
       smsSent = true;
     }
-    lcd.clear();
-    lcd.setCursor(0, 0); lcd.print("DANGER Vent Open");
-    lcd.setCursor(0, 1); lcd.print(co2ppm, 0); lcd.print("ppm");
-    digitalWrite(ledR, HIGH); digitalWrite(ledG, LOW);
-    digitalWrite(ledO, LOW);  digitalWrite(buzzer, HIGH);
+
+    if (!ventFailed && millis() - dangerStart > 10000) {
+      if (co2ppm > 1200 || testFire) ventFailed = true;
+    }
+
+    if (ventFailed) {
+      bool beepOn = (millis() / 1000) % 2 == 0;
+      digitalWrite(buzzer, beepOn ? HIGH : LOW);
+      digitalWrite(ledO,   beepOn ? HIGH : LOW);
+      digitalWrite(ledR,   HIGH);
+      digitalWrite(ledG,   LOW);
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("VENTING FAILED! ");
+      lcd.setCursor(0, 1); lcd.print(co2ppm, 0); lcd.print("ppm HIGH");
+    } else {
+      digitalWrite(ledR, HIGH); digitalWrite(ledG, LOW);
+      digitalWrite(ledO, LOW);  digitalWrite(buzzer, HIGH);
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("DANGER Vent Open");
+      lcd.setCursor(0, 1); lcd.print(co2ppm, 0); lcd.print("ppm");
+    }
+
     ventServo.write(180);
   }
 }
