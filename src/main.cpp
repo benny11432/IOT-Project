@@ -7,7 +7,6 @@
 
 #define GSM_RX 16
 #define GSM_TX 17
-#define GSM_RST 5
 #define PHONE "+353830423660"
 
 bool smsSent = false;
@@ -20,57 +19,116 @@ const char* password = "123455432";
 
 const int ledG = 33, ledO = 25, ledR = 26, buzzer = 27, test = 4;
 const int smokePin = 34, servoPin = 18;
-float co2ppm    = 0;
-bool testFire   = false;
+float co2ppm  = 0;
+bool testFire = false;
 Servo ventServo;
 
-int displayIndex    = 0;
+int displayIndex      = 0;
 const int numStatuses = 5;
-int currentState    = 0;
+int currentState      = 0;
 
-// ─── Cached GSM values (refreshed every 30s) ─────────────────────────────────
-String cachedSimStatus  = "Checking...";
+String cachedSimStatus   = "Checking...";
 String cachedNetworkName = "Checking...";
 unsigned long lastGsmCheck = 0;
 const unsigned long GSM_REFRESH_MS = 30000;
 
+// ─── Non-blocking SMS state machine ──────────────────────────────────────────
+enum SmsState { SMS_IDLE, SMS_WAIT_CMGF, SMS_WAIT_CMGS, SMS_WAIT_DONE };
+SmsState smsState      = SMS_IDLE;
+unsigned long smsTimer = 0;
+String pendingSmsMsg   = "";
 
 // ─── GSM INIT ────────────────────────────────────────────────────────────────
 void initGSM() {
-  digitalWrite(GSM_RST, LOW);
-  delay(1000);
-  digitalWrite(GSM_RST, HIGH);
-  delay(8000);
+  delay(3000);
   while (Serial2.available()) Serial2.read();
-  Serial2.println("AT");
+
+  Serial2.print("AT\r");
   delay(1000);
   while (Serial2.available()) Serial.write(Serial2.read());
-  Serial2.println("AT+CMGF=1");
+
+  Serial2.print("AT+CMGF=1\r");
   delay(1000);
   while (Serial2.available()) Serial.write(Serial2.read());
+
+  Serial.println("Waiting for network...");
+  for (int i = 0; i < 15; i++) {
+    Serial2.print("AT+CREG?\r");
+    delay(1000);
+    String resp = "";
+    while (Serial2.available()) resp += (char)Serial2.read();
+    Serial.println(resp);
+    if (resp.indexOf("+CREG: 0,1") >= 0 || resp.indexOf("+CREG: 0,5") >= 0) {
+      Serial.println("Network registered!");
+      break;
+    }
+  }
+
   Serial.println("GSM Init Done");
 }
 
-
-// ─── SEND SMS ────────────────────────────────────────────────────────────────
-void sendSMS(String message) {
-  Serial2.println("AT+CMGF=1");
-  delay(500);
-  Serial2.println("AT+CMGS=\"" + String(PHONE) + "\"");
-  delay(500);
-  Serial2.print(message);
-  Serial2.write(26);
-  delay(3000);
-  while (Serial2.available()) Serial.write(Serial2.read());
-  Serial.println("\nSMS Sent: " + message);
+// ─── NON-BLOCKING SMS ────────────────────────────────────────────────────────
+void queueSMS(String message) {
+  if (smsState != SMS_IDLE) return;
+  pendingSmsMsg = message;
+  smsState      = SMS_WAIT_CMGF;
+  smsTimer      = millis();
+  Serial2.print("AT+CMGF=1\r");
+  Serial.println("SMS queued: " + message);
 }
 
+void tickSMS() {
+  switch (smsState) {
 
-// ─── GSM STATUS (called on interval, not per page load) ──────────────────────
+    case SMS_IDLE:
+      break;
+
+    case SMS_WAIT_CMGF:
+      if (millis() - smsTimer > 1000) {
+        String r = "";
+        while (Serial2.available()) r += (char)Serial2.read();
+        if (r.indexOf("OK") >= 0) {
+          Serial2.print("AT+CMGS=\"" + String(PHONE) + "\"\r");
+          smsState = SMS_WAIT_CMGS;
+        } else {
+          // retry
+          Serial2.print("AT+CMGF=1\r");
+        }
+        smsTimer = millis();
+      }
+      break;
+
+    case SMS_WAIT_CMGS:
+      if (millis() - smsTimer > 1000) {
+        Serial2.print(pendingSmsMsg);
+        Serial2.print("\r");
+        Serial2.write(26);    // Ctrl+Z
+        Serial2.println();    // flush
+        smsState = SMS_WAIT_DONE;
+        smsTimer = millis();
+      }
+      break;
+
+    case SMS_WAIT_DONE:
+      if (millis() - smsTimer > 4000) {
+        String r = "";
+        while (Serial2.available()) r += (char)Serial2.read();
+        Serial.println("SMS Response: " + r);
+        if (r.indexOf("+CMGS") >= 0)
+          Serial.println("✓ SMS Delivered: " + pendingSmsMsg);
+        else
+          Serial.println("✗ SMS failed - check SIM credit/signal");
+        smsState = SMS_IDLE;
+      }
+      break;
+  }
+}
+
+// ─── GSM STATUS ──────────────────────────────────────────────────────────────
 void refreshGsmStatus() {
-  // --- SIM registration ---
   while (Serial2.available()) Serial2.read();
-  Serial2.println("AT+CREG?");
+
+  Serial2.print("AT+CREG?\r");
   delay(1000);
   String regResponse = "";
   while (Serial2.available()) regResponse += (char)Serial2.read();
@@ -80,9 +138,9 @@ void refreshGsmStatus() {
   else
     cachedSimStatus = "No Network";
 
-  // --- Network operator name ---
   while (Serial2.available()) Serial2.read();
-  Serial2.println("AT+COPS?");
+
+  Serial2.print("AT+COPS?\r");
   delay(1000);
   String copsResponse = "";
   while (Serial2.available()) copsResponse += (char)Serial2.read();
@@ -94,7 +152,6 @@ void refreshGsmStatus() {
   else
     cachedNetworkName = "Unknown";
 }
-
 
 // ─── DASHBOARD HTML ──────────────────────────────────────────────────────────
 String buildDashboard() {
@@ -121,76 +178,21 @@ String buildDashboard() {
     body {
       font-family: 'Segoe UI', sans-serif;
       background: linear-gradient(135deg, #1a4a1a 0%, #2d7a2d 50%, #1a4a1a 100%);
-      min-height: 100vh;
-      padding: 20px;
-      color: #fff;
+      min-height: 100vh; padding: 20px; color: #fff;
     }
-    h1 {
-      text-align: center;
-      font-size: 2em;
-      margin-bottom: 6px;
-      text-shadow: 0 2px 4px rgba(0,0,0,0.4);
-      letter-spacing: 2px;
-    }
-    .subtitle {
-      text-align: center;
-      font-size: 0.85em;
-      opacity: 0.7;
-      margin-bottom: 24px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      max-width: 900px;
-      margin: 0 auto;
-    }
-    .card {
-      background: rgba(0,0,0,0.35);
-      border-radius: 14px;
-      padding: 20px;
-      border: 1px solid rgba(255,255,255,0.1);
-      backdrop-filter: blur(6px);
-    }
-    .card h2 {
-      font-size: 0.75em;
-      text-transform: uppercase;
-      letter-spacing: 1.5px;
-      opacity: 0.65;
-      margin-bottom: 10px;
-    }
-    .card .value {
-      font-size: 2em;
-      font-weight: 700;
-    }
-    .card .unit {
-      font-size: 0.85em;
-      opacity: 0.6;
-      margin-top: 4px;
-    }
-    .status-badge {
-      display: inline-block;
-      padding: 6px 16px;
-      border-radius: 20px;
-      font-weight: 700;
-      font-size: 1.1em;
-      color: #fff;
-    }
-    .dot {
-      display: inline-block;
-      width: 10px; height: 10px;
-      border-radius: 50%;
-      margin-right: 6px;
-    }
+    h1 { text-align: center; font-size: 2em; margin-bottom: 6px; text-shadow: 0 2px 4px rgba(0,0,0,0.4); letter-spacing: 2px; }
+    .subtitle { text-align: center; font-size: 0.85em; opacity: 0.7; margin-bottom: 24px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; max-width: 900px; margin: 0 auto; }
+    .card { background: rgba(0,0,0,0.35); border-radius: 14px; padding: 20px; border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(6px); }
+    .card h2 { font-size: 0.75em; text-transform: uppercase; letter-spacing: 1.5px; opacity: 0.65; margin-bottom: 10px; }
+    .card .value { font-size: 2em; font-weight: 700; }
+    .card .unit { font-size: 0.85em; opacity: 0.6; margin-top: 4px; }
+    .status-badge { display: inline-block; padding: 6px 16px; border-radius: 20px; font-weight: 700; font-size: 1.1em; color: #fff; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
     .dot-green  { background: #2ecc71; }
     .dot-red    { background: #e74c3c; }
     .dot-orange { background: #f39c12; }
-    .footer {
-      text-align: center;
-      margin-top: 24px;
-      font-size: 0.75em;
-      opacity: 0.5;
-    }
+    .footer { text-align: center; margin-top: 24px; font-size: 0.75em; opacity: 0.5; }
   </style>
 </head>
 <body>
@@ -205,7 +207,6 @@ String buildDashboard() {
 
   html += R"rawhtml(
     </div>
-
     <div class="card">
       <h2>CO2 Level</h2>
       <div class="value">)rawhtml";
@@ -213,14 +214,12 @@ String buildDashboard() {
   html += R"rawhtml( <span style="font-size:0.5em;opacity:0.7">ppm</span></div>
       <div class="unit">Normal &lt;800 &nbsp;&#183;&nbsp; Warning &lt;1200 &nbsp;&#183;&nbsp; Danger 1200+</div>
     </div>
-
     <div class="card">
       <h2>Vent Position</h2>
       <div class="value" style="font-size:1.3em;">)rawhtml";
   html += ventPos;
   html += R"rawhtml(</div>
     </div>
-
     <div class="card">
       <h2>WiFi</h2>
       <div class="value" style="font-size:1.2em;">
@@ -236,7 +235,6 @@ String buildDashboard() {
   html += (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "N/A";
   html += R"rawhtml(</div>
     </div>
-
     <div class="card">
       <h2>GSM / SMS</h2>
       <div class="value" style="font-size:1.2em;">
@@ -252,7 +250,6 @@ String buildDashboard() {
   html += smsSent ? "Sent" : "Standby";
   html += R"rawhtml(</div>
     </div>
-
     <div class="card">
       <h2>Test Mode</h2>
       <div class="value" style="font-size:1.2em;">
@@ -273,11 +270,10 @@ String buildDashboard() {
   return html;
 }
 
-
 // ─── SETUP ───────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  pinMode(GSM_RST, OUTPUT);
+  Serial2.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
   initGSM();
 
   lcd.begin(16, 2);
@@ -298,7 +294,6 @@ void setup() {
   else
     Serial.println("\nWiFi Failed - continuing without it");
 
-  // Initial GSM status fetch
   refreshGsmStatus();
   lastGsmCheck = millis();
 
@@ -312,19 +307,14 @@ void setup() {
   digitalWrite(ledR, LOW);  digitalWrite(buzzer, LOW);
 }
 
-
 // ─── LOOP ────────────────────────────────────────────────────────────────────
 void loop() {
   static unsigned long normalTimer = 0;
 
-  // Refresh GSM status every 30 seconds
-  if (millis() - lastGsmCheck > GSM_REFRESH_MS) {
-    refreshGsmStatus();
-    lastGsmCheck = millis();
-  }
+  tickSMS(); // non-blocking, runs every iteration
 
   int sensorValue = analogRead(smokePin);
-  co2ppm  = map(sensorValue, 100, 3000, 400, 2000);
+  co2ppm   = map(sensorValue, 100, 3000, 400, 2000);
   testFire = (digitalRead(test) == LOW);
 
   if (testFire || co2ppm > 1200)  currentState = 2;
@@ -358,7 +348,7 @@ void loop() {
         lcd.setCursor(0, 1); lcd.print("System OK");
       }
       displayIndex = (displayIndex + 1) % numStatuses;
-      normalTimer = millis();
+      normalTimer  = millis();
     }
     digitalWrite(ledG, HIGH); digitalWrite(ledO, LOW);
     digitalWrite(ledR, LOW);  digitalWrite(buzzer, LOW);
@@ -366,8 +356,8 @@ void loop() {
 
   // ── WARNING ──
   else if (currentState == 1) {
-    if (!smsSent) {
-      sendSMS("WARNING: CO2 " + String(co2ppm) + "ppm - Vent partially opened!");
+    if (!smsSent && smsState == SMS_IDLE) {
+      queueSMS("WARNING: CO2 " + String(co2ppm) + "ppm - Vent partially opened!");
       smsSent = true;
     }
     lcd.clear();
@@ -380,8 +370,8 @@ void loop() {
 
   // ── DANGER ──
   else if (currentState == 2) {
-    if (!smsSent) {
-      sendSMS("DANGER: CO2 " + String(co2ppm) + "ppm - Vent fully opened!");
+    if (!smsSent && smsState == SMS_IDLE) {
+      queueSMS("DANGER: CO2 " + String(co2ppm) + "ppm - Vent fully opened!");
       smsSent = true;
     }
     lcd.clear();
